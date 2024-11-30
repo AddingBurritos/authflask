@@ -2,20 +2,28 @@ from flask import Flask, render_template, request, redirect, url_for, flash
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_sqlalchemy import SQLAlchemy
+from flask_mail import Mail, Message
+from itsdangerous import URLSafeTimedSerializer, SignatureExpired
+from config import Config
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your-secret-key-here'  # Change this to a secure secret key
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
+app.config.from_object(Config)
+
 db = SQLAlchemy(app)
+mail = Mail(app)
 login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = 'login'
+
+# Token serializer for reset links
+serializer = URLSafeTimedSerializer(app.config['SECRET_KEY'])
 
 
 # User model
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(120), nullable=False)
 
     def set_password(self, password):
@@ -62,13 +70,20 @@ def register():
 
     if request.method == 'POST':
         username = request.form['username']
+        email = request.form['email']
         password = request.form['password']
 
+        # Check if username or email already exists
         if User.query.filter_by(username=username).first():
             flash('Username already exists')
             return redirect(url_for('register'))
 
-        user = User(username=username)
+        if User.query.filter_by(email=email).first():
+            flash('Email already registered')
+            return redirect(url_for('register'))
+
+        # Create new user
+        user = User(username=username, email=email)
         user.set_password(password)
         db.session.add(user)
         db.session.commit()
@@ -90,6 +105,64 @@ def dashboard():
 def logout():
     logout_user()
     return redirect(url_for('index'))
+
+
+def send_reset_email(user):
+    # Generate timed token
+    token = serializer.dumps(user.email, salt='password-reset-salt')
+
+    # Create reset link
+    reset_url = url_for('reset_password', token=token, _external=True)
+
+    # Send email
+    msg = Message('Password Reset Request',
+                  sender=app.config['MAIL_USERNAME'],
+                  recipients=[user.email])
+
+    msg.body = f'''To reset your password, visit the following link:
+{reset_url}
+
+If you did not make this request, please ignore this email.
+'''
+    mail.send(msg)
+
+
+@app.route('/forgot_password', methods=['GET', 'POST'])
+def forgot_password():
+    if request.method == 'POST':
+        email = request.form['email']
+        user = User.query.filter_by(email=email).first()
+
+        if user:
+            send_reset_email(user)
+            flash('An email has been sent with instructions to reset your password.')
+            return redirect(url_for('login'))
+        else:
+            flash('Email address not found')
+
+    return render_template('forgot_password.html')
+
+
+@app.route('/reset_password/<token>', methods=['GET', 'POST'])
+def reset_password(token):
+    try:
+        # Verify token and get email (expires after 1 hour)
+        email = serializer.loads(token, salt='password-reset-salt', max_age=3600)
+    except SignatureExpired:
+        flash('The password reset link has expired.')
+        return redirect(url_for('forgot_password'))
+
+    if request.method == 'POST':
+        user = User.query.filter_by(email=email).first()
+
+        if user:
+            new_password = request.form['password']
+            user.set_password(new_password)
+            db.session.commit()
+            flash('Your password has been updated! Please login.')
+            return redirect(url_for('login'))
+
+    return render_template('reset_password.html')
 
 
 if __name__ == '__main__':

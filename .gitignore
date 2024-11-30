@@ -1,2 +1,5 @@
 .idea
 instance
+.env
+__pycache__
+```
