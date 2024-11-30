@@ -1,5 +1,6 @@
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_sqlalchemy import SQLAlchemy
 from flask_mail import Mail, Message
@@ -12,6 +13,7 @@ app = Flask(__name__)
 app.config.from_object(Config)
 
 db = SQLAlchemy(app)
+socketio = SocketIO(app)
 mail = Mail(app)
 login_manager = LoginManager()
 login_manager.init_app(app)
@@ -34,6 +36,13 @@ class ApiKey(db.Model):
         self.key = secrets.token_urlsafe(32)
         self.user_id = user_id
         self.name = name
+
+
+class Message(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    content = db.Column(db.String(500), nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
 
 
 # User model
@@ -69,6 +78,47 @@ def auth_with_api_key():
     return None
 
 
+# WebSocket events
+@socketio.on('connect')
+def handle_connect():
+    if current_user.is_authenticated:
+        join_room(f'user_{current_user.id}')
+        emit('connection_response', {'status': 'connected'})
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    if current_user.is_authenticated:
+        leave_room(f'user_{current_user.id}')
+
+
+@socketio.on('send_message')
+@login_required
+def handle_message(data):
+    if current_user.is_authenticated:
+        message = Message(
+            content=data['message'],
+            user_id=current_user.id
+        )
+        db.session.add(message)
+        db.session.commit()
+
+        emit('new_message', {
+            'message': message.content,
+            'username': current_user.username,
+            'timestamp': message.timestamp.strftime('%Y-%m-%d %H:%M:%S')
+        }, broadcast=True)
+
+
+@socketio.on('join_chat')
+def handle_join_chat():
+    if current_user.is_authenticated:
+        join_room('chat')
+        emit('user_joined', {
+            'username': current_user.username
+        }, room='chat')
+
+
 # API Routes
 @app.route('/api/test', methods=['GET'])
 def api_test():
@@ -82,6 +132,13 @@ def api_test():
 @app.route('/')
 def index():
     return render_template('index.html')
+
+
+@app.route('/chat')
+@login_required
+def chat():
+    messages = Message.query.order_by(Message.timestamp.desc()).limit(50).all()
+    return render_template('chat.html', messages=messages)
 
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -240,5 +297,6 @@ def reset_password(token):
 
 if __name__ == '__main__':
     with app.app_context():
+        db.drop_all()     # This drops all tables
         db.create_all()
     app.run(debug=True)
