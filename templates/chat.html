@@ -3,7 +3,7 @@
 
 {% block content %}
 <div class="row">
-    <div class="col-md-8 offset-md-2">
+    <div class="col-md-9">
         <div class="card">
             <div class="card-header">
                 Chat Room
@@ -11,12 +11,25 @@
             </div>
             <div class="card-body">
                 <div id="chat-messages" class="mb-3" style="height: 400px; overflow-y: auto;">
+                    {% set ns = namespace(last_user=None, last_time=None) %}
                     {% for message in messages %}
-                    <div class="message">
-                        <strong>{{ message.user.username }}</strong>
-                        <small class="text-muted">{{ message.timestamp.strftime('%Y-%m-%d %H:%M:%S') }}</small>
-                        <p>{{ message.content }}</p>
-                    </div>
+                        {% set time_diff = (message.timestamp - ns.last_time).total_seconds() if ns.last_time else 999999 %}
+                        {% if message.sender.username != ns.last_user or time_diff > 300 %}
+                            {% if not loop.first %}
+                                </div>
+                            {% endif %}
+                            <div class="message-group mb-3">
+                                <div class="message-header">
+                                    <strong>{{ message.sender.username }}</strong>
+                                    <small class="text-muted">{{ message.timestamp.strftime('%Y-%m-%d %H:%M:%S') }}</small>
+                                </div>
+                        {% endif %}
+                        <div class="message-content">{{ message.content }}</div>
+                        {% set ns.last_user = message.sender.username %}
+                        {% set ns.last_time = message.timestamp %}
+                        {% if loop.last %}
+                            </div>
+                        {% endif %}
                     {% endfor %}
                 </div>
                 <form id="message-form" class="form-inline">
@@ -28,7 +41,50 @@
             </div>
         </div>
     </div>
+    <div class="col-md-3">
+        <div class="card">
+            <div class="card-header">
+                Active Users
+                <span id="user-count" class="badge bg-primary float-end">0</span>
+            </div>
+            <div class="card-body">
+                <ul id="active-users-list" class="list-group list-group-flush">
+                </ul>
+            </div>
+        </div>
+    </div>
 </div>
+
+<style>
+.message-group {
+    margin-bottom: 1rem;
+}
+.message-header {
+    margin-bottom: 0.5rem;
+}
+.message-content {
+    padding-left: 1rem;
+    margin-bottom: 0.25rem;
+}
+#active-users-list {
+    max-height: 400px;
+    overflow-y: auto;
+}
+.active-user {
+    display: flex;
+    align-items: center;
+    padding: 0.5rem 0;
+}
+.active-user::before {
+    content: "";
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background-color: #28a745;
+    margin-right: 8px;
+}
+</style>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
 <script>
@@ -38,18 +94,54 @@
         const messageInput = document.getElementById('message-input');
         const chatMessages = document.getElementById('chat-messages');
         const connectionStatus = document.getElementById('connection-status');
+        const activeUsersList = document.getElementById('active-users-list');
+        const userCount = document.getElementById('user-count');
+
+        let lastMessageUser = null;
+        let lastMessageTime = null;
+        const MESSAGE_GROUP_THRESHOLD = 300000; // 5 minutes in milliseconds
+
+        function updateActiveUsersList(users) {
+            activeUsersList.innerHTML = '';
+            users.sort().forEach(username => {
+                const li = document.createElement('li');
+                li.className = 'list-group-item active-user';
+                li.textContent = username;
+                activeUsersList.appendChild(li);
+            });
+            userCount.textContent = users.length;
+        }
+
+        function shouldStartNewGroup(username, timestamp) {
+            if (!lastMessageUser || !lastMessageTime) return true;
+            if (lastMessageUser !== username) return true;
+            return (timestamp - lastMessageTime) > MESSAGE_GROUP_THRESHOLD;
+        }
 
         // Connection handlers
         socket.on('connect', () => {
             connectionStatus.textContent = 'Connected';
             connectionStatus.className = 'badge bg-success float-end';
-            socket.emit('join_chat');
+            socket.emit('get_active_users');
         });
 
         socket.on('disconnect', () => {
             connectionStatus.textContent = 'Disconnected';
             connectionStatus.className = 'badge bg-secondary float-end';
+            updateActiveUsersList([]);
         });
+
+        // Active users handling
+        socket.on('active_users_update', function(data) {
+            updateActiveUsersList(data.users);
+        });
+
+        // Heartbeat
+        setInterval(() => {
+            if (socket.connected) {
+                socket.emit('heartbeat');
+            }
+        }, 30000);
 
         // Message handling
         messageForm.addEventListener('submit', function(e) {
@@ -63,22 +155,41 @@
         });
 
         socket.on('new_message', function(data) {
-            const messageDiv = document.createElement('div');
-            messageDiv.className = 'message';
-            messageDiv.innerHTML = `
-                <strong>${data.username}</strong>
-                <small class="text-muted">${data.timestamp}</small>
-                <p>${data.message}</p>
-            `;
-            chatMessages.appendChild(messageDiv);
+            const timestamp = new Date(data.timestamp);
+            const startNewGroup = shouldStartNewGroup(data.username, timestamp.getTime());
+
+            if (startNewGroup) {
+                const messageGroup = document.createElement('div');
+                messageGroup.className = 'message-group mb-3';
+                messageGroup.innerHTML = `
+                    <div class="message-header">
+                        <strong>${data.username}</strong>
+                        <small class="text-muted">${data.timestamp}</small>
+                    </div>
+                    <div class="message-content">${data.message}</div>
+                `;
+                chatMessages.appendChild(messageGroup);
+            } else {
+                const lastGroup = chatMessages.lastElementChild;
+                const messageContent = document.createElement('div');
+                messageContent.className = 'message-content';
+                messageContent.textContent = data.message;
+                lastGroup.appendChild(messageContent);
+            }
+
+            lastMessageUser = data.username;
+            lastMessageTime = timestamp.getTime();
             chatMessages.scrollTop = chatMessages.scrollHeight;
         });
 
-        socket.on('user_joined', function(data) {
-            const joinMessage = document.createElement('div');
-            joinMessage.className = 'text-center text-muted small';
-            joinMessage.textContent = `${data.username} joined the chat`;
-            chatMessages.appendChild(joinMessage);
+        socket.on('user_left', function(data) {
+            const leaveMessage = document.createElement('div');
+            leaveMessage.className = 'text-center text-muted small mb-3';
+            leaveMessage.textContent = `${data.username} left the chat`;
+            chatMessages.appendChild(leaveMessage);
+
+            lastMessageUser = null;
+            lastMessageTime = null;
         });
 
         // Auto-scroll to bottom on load

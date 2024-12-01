@@ -8,6 +8,7 @@ from itsdangerous import URLSafeTimedSerializer, SignatureExpired
 from config import Config
 import secrets
 import datetime
+from collections import defaultdict
 
 app = Flask(__name__)
 app.config.from_object(Config)
@@ -21,6 +22,9 @@ login_manager.login_view = 'login'
 
 # Token serializer for reset links
 serializer = URLSafeTimedSerializer(app.config['SECRET_KEY'])
+
+# Store active users and their last heartbeat
+active_users = defaultdict(lambda: {'last_heartbeat': datetime.datetime.now(datetime.UTC), 'sid': None})
 
 
 # API Key model
@@ -41,8 +45,16 @@ class ApiKey(db.Model):
 class Message(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     content = db.Column(db.String(500), nullable=False)
-    timestamp = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    timestamp = db.Column(db.DateTime, default=datetime.datetime.now(datetime.UTC))
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    sender = db.relationship('User', backref=db.backref('messages_sent', lazy=True))
+
+    def to_dict(self):
+        return {
+            'content': self.content,
+            'timestamp': self.timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+            'username': self.sender.username
+        }
 
 
 # User model
@@ -72,24 +84,70 @@ def auth_with_api_key():
 
     key = ApiKey.query.filter_by(key=api_key).first()
     if key:
-        key.last_used = datetime.datetime.utcnow()
+        key.last_used = datetime.datetime.now(datetime.UTC)
         db.session.commit()
         return key.user
     return None
 
 
 # WebSocket events
+@socketio.on('get_active_users')
+def handle_get_active_users():
+    if current_user.is_authenticated:
+        # Send the list of currently active users to the requesting client
+        emit('active_users_update', {'users': list(active_users.keys())})
+
+
 @socketio.on('connect')
 def handle_connect():
     if current_user.is_authenticated:
         join_room(f'user_{current_user.id}')
+        active_users[current_user.username]['sid'] = request.sid
         emit('connection_response', {'status': 'connected'})
+        # Broadcast updated user list to all clients
+        emit('active_users_update', {'users': list(active_users.keys())}, broadcast=True)
 
 
 @socketio.on('disconnect')
 def handle_disconnect():
     if current_user.is_authenticated:
         leave_room(f'user_{current_user.id}')
+        if current_user.username in active_users:
+            del active_users[current_user.username]
+            emit('user_left', {'username': current_user.username}, broadcast=True)
+            # Broadcast updated user list to all clients
+            emit('active_users_update', {'users': list(active_users.keys())}, broadcast=True)
+
+
+@socketio.on('heartbeat')
+def handle_heartbeat():
+    if current_user.is_authenticated:
+        active_users[current_user.username]['last_heartbeat'] = datetime.datetime.now()
+
+
+# Start the background task for checking inactive users
+@socketio.on('connect')
+def start_background_task():
+    socketio.start_background_task(background_task)
+
+
+def background_task():
+    while True:
+        socketio.sleep(30)  # Check every 30 seconds
+        check_inactive_users()
+
+
+# Function to check for inactive users (called periodically)
+def check_inactive_users():
+    current_time = datetime.datetime.now()
+    inactive_threshold = datetime.timedelta(minutes=1)
+
+    for username, data in list(active_users.items()):
+        if current_time - data['last_heartbeat'] > inactive_threshold:
+            if data['sid']:
+                # User has been inactive, remove them
+                socketio.emit('user_left', {'username': username}, broadcast=True)
+                del active_users[username]
 
 
 @socketio.on('send_message')
@@ -108,15 +166,6 @@ def handle_message(data):
             'username': current_user.username,
             'timestamp': message.timestamp.strftime('%Y-%m-%d %H:%M:%S')
         }, broadcast=True)
-
-
-@socketio.on('join_chat')
-def handle_join_chat():
-    if current_user.is_authenticated:
-        join_room('chat')
-        emit('user_joined', {
-            'username': current_user.username
-        }, room='chat')
 
 
 # API Routes
