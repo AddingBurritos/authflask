@@ -1,18 +1,24 @@
 {% extends "base.html" %}
-{% block title %}Chat Room{% endblock %}
+{% block title %}{{ room.name }}{% endblock %}
 
 {% block content %}
 <div class="row">
     <div class="col-md-9">
         <div class="card">
-            <div class="card-header">
-                Chat Room
-                <span id="connection-status" class="badge bg-secondary float-end">Disconnected</span>
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <div>
+                    <h5 class="mb-0">{{ room.name }}</h5>
+                    <small class="text-muted">Created by {{ room.creator.username }}</small>
+                </div>
+                <div>
+                    <span id="connection-status" class="badge bg-secondary">Disconnected</span>
+                    <a href="{{ url_for('rooms') }}" class="btn btn-outline-secondary btn-sm ml-2">Exit Room</a>
+                </div>
             </div>
             <div class="card-body">
                 <div id="chat-messages" class="mb-3" style="height: 400px; overflow-y: auto;">
                     {% set ns = namespace(last_user=None, last_time=None) %}
-                    {% for message in messages %}
+                    {% for message in messages|reverse %}
                         {% set time_diff = (message.timestamp - ns.last_time).total_seconds() if ns.last_time else 999999 %}
                         {% if message.sender.username != ns.last_user or time_diff > 300 %}
                             {% if not loop.first %}
@@ -44,7 +50,7 @@
     <div class="col-md-3">
         <div class="card">
             <div class="card-header">
-                Active Users
+                Room Members
                 <span id="user-count" class="badge bg-primary float-end">0</span>
             </div>
             <div class="card-body">
@@ -54,37 +60,6 @@
         </div>
     </div>
 </div>
-
-<style>
-.message-group {
-    margin-bottom: 1rem;
-}
-.message-header {
-    margin-bottom: 0.5rem;
-}
-.message-content {
-    padding-left: 1rem;
-    margin-bottom: 0.25rem;
-}
-#active-users-list {
-    max-height: 400px;
-    overflow-y: auto;
-}
-.active-user {
-    display: flex;
-    align-items: center;
-    padding: 0.5rem 0;
-}
-.active-user::before {
-    content: "";
-    display: inline-block;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background-color: #28a745;
-    margin-right: 8px;
-}
-</style>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
 <script>
@@ -97,9 +72,10 @@
         const activeUsersList = document.getElementById('active-users-list');
         const userCount = document.getElementById('user-count');
 
+        const ROOM_ID = {{ room.id }};
         let lastMessageUser = null;
         let lastMessageTime = null;
-        const MESSAGE_GROUP_THRESHOLD = 300000; // 5 minutes in milliseconds
+        const MESSAGE_GROUP_THRESHOLD = 300000;
 
         function updateActiveUsersList(users) {
             activeUsersList.innerHTML = '';
@@ -118,11 +94,11 @@
             return (timestamp - lastMessageTime) > MESSAGE_GROUP_THRESHOLD;
         }
 
-        // Connection handlers
+        // Connection and room handling
         socket.on('connect', () => {
             connectionStatus.textContent = 'Connected';
-            connectionStatus.className = 'badge bg-success float-end';
-            socket.emit('get_active_users');
+            connectionStatus.className = 'badge bg-success';
+            socket.emit('join_room', { room_id: ROOM_ID });
         });
 
         socket.on('disconnect', () => {
@@ -132,14 +108,14 @@
         });
 
         // Active users handling
-        socket.on('active_users_update', function(data) {
+        socket.on('room_users_update', function(data) {
             updateActiveUsersList(data.users);
         });
 
         // Heartbeat
         setInterval(() => {
             if (socket.connected) {
-                socket.emit('heartbeat');
+                socket.emit('heartbeat', { room_id: ROOM_ID });
             }
         }, 30000);
 

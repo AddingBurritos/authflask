@@ -9,6 +9,7 @@ from config import Config
 import secrets
 import datetime
 from collections import defaultdict
+import json
 
 app = Flask(__name__)
 app.config.from_object(Config)
@@ -23,8 +24,18 @@ login_manager.login_view = 'login'
 # Token serializer for reset links
 serializer = URLSafeTimedSerializer(app.config['SECRET_KEY'])
 
-# Store active users and their last heartbeat
-active_users = defaultdict(lambda: {'last_heartbeat': datetime.datetime.now(datetime.UTC), 'sid': None})
+# Update the active users data structure to be indexed by room
+active_rooms = defaultdict(lambda: {
+    'users': {},  # Dictionary of username -> user data for each room
+    'created_at': datetime.datetime.now()
+})
+
+# User data will look like:
+# active_rooms[room_id]['users'][username] = {
+#     'sid': session_id,
+#     'last_heartbeat': timestamp,
+#     'joined_at': timestamp
+# }
 
 
 # API Key model
@@ -32,7 +43,7 @@ class ApiKey(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     key = db.Column(db.String(64), unique=True, nullable=False)
     name = db.Column(db.String(50), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.now(datetime.UTC))
     last_used = db.Column(db.DateTime)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
 
@@ -42,11 +53,20 @@ class ApiKey(db.Model):
         self.name = name
 
 
-class Message(db.Model):
+class ChatRoom(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.now(datetime.UTC))
+    creator_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    messages = db.relationship('ChatMessage', backref='room', lazy=True, cascade='all, delete-orphan')
+
+
+class ChatMessage(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     content = db.Column(db.String(500), nullable=False)
     timestamp = db.Column(db.DateTime, default=datetime.datetime.now(datetime.UTC))
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    room_id = db.Column(db.Integer, db.ForeignKey('chat_room.id'), nullable=False)
     sender = db.relationship('User', backref=db.backref('messages_sent', lazy=True))
 
     def to_dict(self):
@@ -57,12 +77,12 @@ class Message(db.Model):
         }
 
 
-# User model
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(120), nullable=False)
+    rooms_created = db.relationship('ChatRoom', backref='creator', lazy=True)
     api_keys = db.relationship('ApiKey', backref='user', lazy=True)
 
     def set_password(self, password):
@@ -90,82 +110,215 @@ def auth_with_api_key():
     return None
 
 
+# Room management routes
+@app.route('/rooms')
+@login_required
+def rooms():
+    available_rooms = ChatRoom.query.all()
+    return render_template('rooms.html', rooms=available_rooms)
+
+
+@app.route('/room/<int:room_id>')
+@login_required
+def chat_room(room_id):
+    room = ChatRoom.query.get_or_404(room_id)
+    messages = ChatMessage.query.filter_by(room_id=room_id).order_by(ChatMessage.timestamp.desc()).limit(50).all()
+    return render_template('chat.html', room=room, messages=messages)
+
+
+@app.route('/room/create', methods=['POST'])
+@login_required
+def create_room():
+    name = request.form.get('room_name')
+    if not name:
+        flash('Room name is required')
+        return redirect(url_for('rooms'))
+
+    room = ChatRoom(name=name, creator_id=current_user.id)
+    db.session.add(room)
+    db.session.commit()
+
+    flash(f'Room "{name}" created successfully')
+    return redirect(url_for('chat_room', room_id=room.id))
+
+
+@app.route('/room/<int:room_id>/delete', methods=['POST'])
+@login_required
+def delete_room(room_id):
+    room = ChatRoom.query.get_or_404(room_id)
+    if room.creator_id != current_user.id:
+        flash('You can only delete rooms you created')
+        return redirect(url_for('rooms'))
+
+    db.session.delete(room)
+    db.session.commit()
+    flash('Room deleted successfully')
+    return redirect(url_for('rooms'))
+
+
 # WebSocket events
-@socketio.on('get_active_users')
-def handle_get_active_users():
-    if current_user.is_authenticated:
-        # Send the list of currently active users to the requesting client
-        emit('active_users_update', {'users': list(active_users.keys())})
-
-
 @socketio.on('connect')
 def handle_connect():
     if current_user.is_authenticated:
-        join_room(f'user_{current_user.id}')
-        active_users[current_user.username]['sid'] = request.sid
         emit('connection_response', {'status': 'connected'})
-        # Broadcast updated user list to all clients
-        emit('active_users_update', {'users': list(active_users.keys())}, broadcast=True)
+
+
+@socketio.on('join_room')
+def handle_join_room(data):
+    if current_user.is_authenticated:
+        room_id = data['room_id']
+
+        # Remove user from any previous room
+        for r_id in active_rooms:
+            if current_user.username in active_rooms[r_id]['users']:
+                leave_room(f"room_{r_id}")
+                del active_rooms[r_id]['users'][current_user.username]
+                # Notify previous room that user left
+                emit('user_left', {
+                    'username': current_user.username,
+                    'room_id': r_id
+                }, to=f"room_{r_id}")
+                # Update previous room's user list
+                emit('room_users_update', {
+                    'users': list(active_rooms[r_id]['users'].keys())
+                }, to=f"room_{r_id}")
+                print('join_room cleanup')
+                print(active_rooms[room_id]['users'].keys())
+
+        # Join new room
+        join_room(f"room_{room_id}")
+        active_rooms[room_id]['users'][current_user.username] = {
+            'sid': request.sid,
+            'last_heartbeat': datetime.datetime.now(),
+            'joined_at': datetime.datetime.now()
+        }
+
+        # Notify room of new user
+        emit('user_joined', {
+            'username': current_user.username,
+            'room_id': room_id
+        }, to=f"room_{room_id}")
+
+        # Send updated user list for this room
+        emit('room_users_update', {
+            'users': list(active_rooms[room_id]['users'].keys())
+        }, to=f"room_{room_id}")
+        print('join_room')
+        print(active_rooms[room_id]['users'].keys())
+
+
+@socketio.on('leave_room')
+def handle_leave_room(data):
+    if current_user.is_authenticated:
+        room_id = data['room_id']
+        if room_id in active_rooms and current_user.username in active_rooms[room_id]['users']:
+            leave_room(f"room_{room_id}")
+            del active_rooms[room_id]['users'][current_user.username]
+
+            # Notify room that user left
+            emit('user_left', {
+                'username': current_user.username,
+                'room_id': room_id
+            }, to=f"room_{room_id}")
+
+            # Update room's user list
+            emit('room_users_update', {
+                'users': list(active_rooms[room_id]['users'].keys())
+            }, to=f"room_{room_id}")
+
+            # Clean up empty rooms
+            if not active_rooms[room_id]['users']:
+                del active_rooms[room_id]
+            print('leave_room')
+            print(active_rooms[room_id]['users'].keys())
+
+
+@socketio.on('heartbeat')
+def handle_heartbeat(data):
+    if current_user.is_authenticated:
+        for room_id in active_rooms:
+            if current_user.username in active_rooms[room_id]['users']:
+                active_rooms[room_id]['users'][current_user.username]['last_heartbeat'] = datetime.datetime.now()
+                print(data)
+                check_inactive_users(data['room_id'])
 
 
 @socketio.on('disconnect')
 def handle_disconnect():
     if current_user.is_authenticated:
-        leave_room(f'user_{current_user.id}')
-        if current_user.username in active_users:
-            del active_users[current_user.username]
-            emit('user_left', {'username': current_user.username}, broadcast=True)
-            # Broadcast updated user list to all clients
-            emit('active_users_update', {'users': list(active_users.keys())}, broadcast=True)
+        for room_id in list(active_rooms.keys()):  # Use list to avoid runtime modification issues
+            if current_user.username in active_rooms[room_id]['users']:
+                del active_rooms[room_id]['users'][current_user.username]
 
+                # Notify room that user left
+                emit('user_left', {
+                    'username': current_user.username,
+                    'room_id': room_id
+                }, to=f"room_{room_id}")
 
-@socketio.on('heartbeat')
-def handle_heartbeat():
-    if current_user.is_authenticated:
-        active_users[current_user.username]['last_heartbeat'] = datetime.datetime.now()
+                # Update room's user list
+                emit('room_users_update', {
+                    'users': list(active_rooms[room_id]['users'].keys())
+                }, to=f"room_{room_id}")
 
-
-# Start the background task for checking inactive users
-@socketio.on('connect')
-def start_background_task():
-    socketio.start_background_task(background_task)
-
-
-def background_task():
-    while True:
-        socketio.sleep(30)  # Check every 30 seconds
-        check_inactive_users()
-
-
-# Function to check for inactive users (called periodically)
-def check_inactive_users():
-    current_time = datetime.datetime.now()
-    inactive_threshold = datetime.timedelta(minutes=1)
-
-    for username, data in list(active_users.items()):
-        if current_time - data['last_heartbeat'] > inactive_threshold:
-            if data['sid']:
-                # User has been inactive, remove them
-                socketio.emit('user_left', {'username': username}, broadcast=True)
-                del active_users[username]
+                # Clean up empty rooms
+                if not active_rooms[room_id]['users']:
+                    del active_rooms[room_id]
+                print('disconnect')
+                print(active_rooms[room_id]['users'].keys())
 
 
 @socketio.on('send_message')
-@login_required
 def handle_message(data):
     if current_user.is_authenticated:
-        message = Message(
-            content=data['message'],
-            user_id=current_user.id
-        )
-        db.session.add(message)
-        db.session.commit()
+        # Find which room the user is in
+        room_id = None
+        for r_id in active_rooms:
+            if current_user.username in active_rooms[r_id]['users']:
+                room_id = r_id
+                break
 
-        emit('new_message', {
-            'message': message.content,
-            'username': current_user.username,
-            'timestamp': message.timestamp.strftime('%Y-%m-%d %H:%M:%S')
-        }, broadcast=True)
+        if room_id:
+            message = ChatMessage(
+                content=data['message'],
+                user_id=current_user.id,
+                room_id=room_id
+            )
+            db.session.add(message)
+            db.session.commit()
+
+            emit('new_message', {
+                'username': current_user.username,
+                'message': message.content,
+                'timestamp': message.timestamp.strftime('%Y-%m-%d %H:%M:%S')
+            }, to=f"room_{room_id}")
+
+
+# Background task to check for inactive users
+def check_inactive_users(room_id):
+    current_time = datetime.datetime.now()
+    inactive_threshold = datetime.timedelta(minutes=1)
+
+    for username in list(active_rooms[room_id]['users']):
+        last_heartbeat = active_rooms[room_id]['users'][username]['last_heartbeat']
+        if current_time - last_heartbeat > inactive_threshold:
+            # User has been inactive, remove them from the room
+            del active_rooms[room_id]['users'][username]
+
+            emit('user_left', {
+                'username': username,
+                'room_id': room_id
+            }, to=f"room_{room_id}")
+
+            emit('room_users_update', {
+                'users': list(active_rooms[room_id]['users'])
+            }, to=f"room_{room_id}")
+
+            # Clean up empty rooms
+            if not active_rooms[room_id]['users']:
+                del active_rooms[room_id]
+            print('check_inactive_users')
+            print(active_rooms[room_id]['users'].keys())
 
 
 # API Routes
@@ -186,7 +339,7 @@ def index():
 @app.route('/chat')
 @login_required
 def chat():
-    messages = Message.query.order_by(Message.timestamp.desc()).limit(50).all()
+    messages = ChatMessage.query.order_by(ChatMessage.timestamp.desc()).limit(50).all()
     return render_template('chat.html', messages=messages)
 
 
@@ -295,8 +448,8 @@ def send_reset_email(user):
 
     # Send email
     msg = Message('Password Reset Request',
-                  sender=app.config['MAIL_USERNAME'],
-                  recipients=[user.email])
+                      sender=app.config['MAIL_USERNAME'],
+                      recipients=[user.email])
 
     msg.body = f'''To reset your password, visit the following link:
 {reset_url}
@@ -346,6 +499,6 @@ def reset_password(token):
 
 if __name__ == '__main__':
     with app.app_context():
-        db.drop_all()     # This drops all tables
+        #db.drop_all()     # This drops all tables
         db.create_all()
     app.run(debug=True)
