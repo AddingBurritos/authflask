@@ -18,7 +18,7 @@
             <div class="card-body">
                 <div id="chat-messages" class="mb-3" style="height: 400px; overflow-y: auto;">
                     {% set ns = namespace(last_user=None, last_time=None) %}
-                    {% for message in messages|reverse %}
+                    {% for message in messages %}
                         {% set time_diff = (message.timestamp - ns.last_time).total_seconds() if ns.last_time else 999999 %}
                         {% if message.sender.username != ns.last_user or time_diff > 300 %}
                             {% if not loop.first %}
@@ -37,26 +37,25 @@
                             </div>
                         {% endif %}
                     {% endfor %}
-                </div>
-                <form id="message-form" class="form-inline">
-                    <div class="input-group">
-                        <input type="text" id="message-input" class="form-control" placeholder="Type your message...">
-                        <button type="submit" class="btn btn-primary">Send</button>
-                    </div>
-                </form>
             </div>
+            <form id="message-form" class="form-inline">
+                <div class="input-group">
+                    <input type="text" id="message-input" class="form-control" placeholder="Type your message...">
+                    <button type="submit" class="btn btn-primary">Send</button>
+                </div>
+            </form>
         </div>
     </div>
-    <div class="col-md-3">
-        <div class="card">
-            <div class="card-header">
-                Room Members
-                <span id="user-count" class="badge bg-primary float-end">0</span>
-            </div>
-            <div class="card-body">
-                <ul id="active-users-list" class="list-group list-group-flush">
-                </ul>
-            </div>
+</div>
+<div class="col-md-3">
+    <div class="card">
+        <div class="card-header">
+            Room Members
+            <span id="user-count" class="badge bg-primary float-end">0</span>
+        </div>
+        <div class="card-body">
+            <ul id="active-users-list" class="list-group list-group-flush">
+            </ul>
         </div>
     </div>
 </div>
